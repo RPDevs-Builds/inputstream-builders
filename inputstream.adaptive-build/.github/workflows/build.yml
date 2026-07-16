@@ -1,0 +1,227 @@
+name: Build and Dispatch Adaptive
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_input:
+        description: 'Branch to build'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - Piers
+          - Omega
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  check-runner:
+    runs-on: [self-hosted, linux64]
+    outputs:
+      runner_status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Check if self-hosted runner is online
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GH_PAT }}
+        run: |
+          echo "Checking runner status..."
+          RUNNERS_JSON=$(curl -s -H "Authorization: token $GH_TOKEN"             "https://api.github.com/repos/${{ github.repository }}/actions/runners")
+          ONLINE=$(echo "$RUNNERS_JSON" | jq '.runners[] | select(.status == "online") | .name' 2>/dev/null)
+          
+          if [ -z "$ONLINE" ]; then
+            ORG="${{ github.repository_owner }}"
+            echo "Checking org $ORG runners..."
+            RUNNERS_JSON=$(curl -s -H "Authorization: token $GH_TOKEN"               "https://api.github.com/orgs/$ORG/actions/runners")
+            ONLINE=$(echo "$RUNNERS_JSON" | jq '.runners[] | select(.status == "online") | .name' 2>/dev/null)
+          fi
+          
+          if [ -n "$ONLINE" ]; then
+            echo "Found online self-hosted runner(s):"
+            echo "$ONLINE"
+            echo "status=online" >> $GITHUB_OUTPUT
+          else
+            echo "No online self-hosted runners found. Will fallback to GitHub-hosted."
+            echo "status=offline" >> $GITHUB_OUTPUT
+          fi
+
+  setup-matrix:
+    runs-on: [self-hosted, linux64]
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ github.event.inputs.branch_input }}" == "both" ]; then
+            echo 'matrix={"branch": ["Piers", "Omega"], "platform": ["linux64", "win64", "android-arm64", "osx64"]}' >> $GITHUB_OUTPUT
+          else
+            echo 'matrix={"branch": ["${{ github.event.inputs.branch_input }}"], "platform": ["linux64", "win64", "android-arm64", "osx64"]}' >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: [setup-matrix, check-runner]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    name: Build ${{ matrix.branch }} on ${{ matrix.platform }}
+    runs-on: ${{ (matrix.platform == 'osx64' && 'macos-latest') || (needs.check-runner.outputs.runner_status == 'online' && ('True' == 'True' && fromJSON('["self-hosted", "linux64"]') || fromJSON('["self-hosted", "lightweight"]')) || 'ubuntu-22.04') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          repository: xbmc/inputstream.adaptive
+          ref: ${{ matrix.branch == 'Piers' && ('inputstream.adaptive' == 'inputstream.ffmpegdirect' || 'inputstream.adaptive' == 'inputstream.adaptive') && 'Piers' || (matrix.branch == 'Piers' && 'master' || 'Omega') }}
+          path: source/inputstream.adaptive
+          fetch-depth: 1
+
+      - name: Install System Dependencies
+        run: |
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            sudo apt update
+            sudo apt install -y build-essential autoconf automake autopoint gettext cmake curl gawk gperf python3-dev libtool zip unzip \
+              libudev-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev libva-dev libvdpau-dev libxml2-dev libxslt1-dev \
+              libsqlite3-dev libcurl4-openssl-dev libssl-dev libbluray-dev libcdio-dev libiso9660-dev liblzo2-dev libpcre3-dev \
+              libmysqlclient-dev libcap-dev libfribidi-dev libfontconfig1-dev libfreetype6-dev libass-dev libfribidi-dev \
+              libdbus-1-dev libsystemd-dev libavahi-client-dev libavahi-common-dev libmicrohttpd-dev libtinyxml-dev \
+              libyajl-dev libplist-dev libnfs-dev libshairplay-dev libsmbclient-dev libfmt-dev libspdlog-dev libflatbuffers-dev
+            if [ "${{ matrix.platform }}" == "linux64" ]; then
+              sudo apt install -y libx11-dev libxext-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxrender-dev libxss-dev libgl1-mesa-dev
+            fi
+          elif [ "${{ runner.os }}" == "Windows" ]; then
+            choco install cmake ninja nasm zip -y
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            brew install cmake ninja nasm
+          fi
+
+      - name: Build and Package
+        run: |
+          # Get Version for directory structure
+          if [ -f source/inputstream.adaptive/version.txt ]; then
+            VERSION=$(grep "VERSION_CODE" source/inputstream.adaptive/version.txt | awk '{print $2}')
+          else
+            VERSION="v-$(date +'%Y%m%d')"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          
+          # Target Directory: ./compiled/os/version/
+          OUT_DIR="compiled/${{ matrix.platform }}/$VERSION"
+          mkdir -p "$OUT_DIR"
+          echo "OUT_DIR=$OUT_DIR" >> $GITHUB_ENV
+
+          if [ "True" == "True" ]; then
+            echo "🚀 Performing C++ Build for ${{ matrix.platform }}..."
+            if [ "inputstream.adaptive" == "xbmc" ]; then
+              if [ "${{ matrix.platform }}" == "linux64" ]; then
+                mkdir build && cd build
+                cmake ../source/xbmc -DCMAKE_INSTALL_PREFIX=../$OUT_DIR -DAPP_RENDER_SYSTEM=gl
+                make -j$(nproc) install
+              else
+                # Cross-compilation or non-linux native using depends
+                cd source/xbmc/tools/depends
+                ./bootstrap
+                case "${{ matrix.platform }}" in
+                  win64) CONFIG_FLAGS="--host=x86_64-w64-mingw32" ;;
+                  android-arm64) CONFIG_FLAGS="--host=aarch64-linux-android --with-sdk=/opt/android-sdk --with-ndk=/opt/android-sdk/ndk-bundle" ;;
+                  osx64) CONFIG_FLAGS="--with-platform=macos" ;;
+                esac
+                ./configure --prefix=$(pwd)/../../../../xbmc-deps $CONFIG_FLAGS
+                make -j$(nproc || sysctl -n hw.ncpu)
+                cd ../../../
+                mkdir build && cd build
+                cmake ../source/xbmc -DCMAKE_INSTALL_PREFIX=../$OUT_DIR -DCMAKE_PREFIX_PATH=$(pwd)/../xbmc-deps
+                make -j$(nproc || sysctl -n hw.ncpu) install
+              fi
+            else
+              # Addon C++ Build
+              if [ "${{ matrix.platform }}" == "win64" ]; then
+                echo "⚠️ Windows cross-compiling addons not fully supported yet. Skipping."
+                exit 0
+              fi
+
+              # Download pre-compiled depends (for cross-platform builds)
+              if [ "${{ matrix.platform }}" != "linux64" ]; then
+                echo "⬇️ Downloading Pre-compiled Depends for Addon..."
+                DEPENDS_BRANCH="${{ matrix.branch == 'Piers' && 'Piers' || 'Omega' }}"
+                TAG="depends-${{ matrix.platform }}-$DEPENDS_BRANCH"
+                gh release download "$TAG" --repo "RPDevs-Builds/kodi-build" --pattern "depends-${{ matrix.platform }}.tar.gz" --dir . || echo "⚠️ Pre-compiled depends not found."
+                if [ -f "depends-${{ matrix.platform }}.tar.gz" ]; then
+                  echo "✅ Extracting Depends..."
+                  mkdir -p ${{ github.workspace }}/xbmc-deps
+                  tar -xzf depends-${{ matrix.platform }}.tar.gz -C ${{ github.workspace }}/xbmc-deps
+                fi
+              fi
+
+              # Download compiled Kodi Core (for KodiConfig.cmake and headers)
+              echo "⬇️ Downloading Pre-compiled Kodi Core..."
+              CORE_REPO="RPDevs-Builds/xbmc-build-${{ matrix.platform }}"
+              # Find the latest release tag for the branch
+              TAG=$(gh release list --repo "$CORE_REPO" --limit 20 | grep -E "${{ matrix.branch }}" | head -n 1 | awk '{print $1}')
+              if [ -n "$TAG" ]; then
+                echo "Found Kodi Core release: $TAG"
+                if [ "${{ matrix.platform }}" == "linux64" ]; then
+                  gh release download "$TAG" --repo "$CORE_REPO" --pattern "xbmc-*.tar.gz" --dir .
+                  if [ -f xbmc-*.tar.gz ]; then
+                    echo "✅ Extracting Kodi Core..."
+                    mkdir -p ${{ github.workspace }}/xbmc-deps
+                    tar -xzf xbmc-*.tar.gz -C ${{ github.workspace }}/xbmc-deps
+                  fi
+                else
+                  gh release download "$TAG" --repo "$CORE_REPO" --pattern "xbmc-*.zip" --dir .
+                  if [ -f xbmc-*.zip ]; then
+                    echo "✅ Extracting Kodi Core..."
+                    mkdir -p ${{ github.workspace }}/xbmc-deps
+                    unzip -o xbmc-*.zip -d ${{ github.workspace }}/xbmc-deps
+                  fi
+                fi
+              else
+                echo "⚠️ Pre-compiled Kodi Core release not found for ${{ matrix.branch }}. Addon build might fail."
+              fi
+
+              mkdir build && cd build
+              cmake ../source/inputstream.adaptive -DCMAKE_INSTALL_PREFIX=../$OUT_DIR -DCMAKE_PREFIX_PATH=${{ github.workspace }}/xbmc-deps -DKodi_DIR=${{ github.workspace }}/xbmc-deps/lib/kodi
+              make -j$(nproc || sysctl -n hw.ncpu) install
+            fi
+          else
+            echo "📦 Packaging Python/XML Addon..."
+            cp -rv source/inputstream.adaptive/* "$OUT_DIR/"
+            touch "$OUT_DIR/.kodi_build_marker"
+          fi
+
+      - name: Create Archive
+        run: |
+          TAG="v-${{ env.VERSION }}-${{ matrix.branch }}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          FILENAME="inputstream.adaptive-${{ matrix.platform }}-${{ env.VERSION }}-${{ matrix.branch }}"
+          if [ "${{ matrix.platform }}" == "linux64" ]; then
+            tar -czf "$FILENAME.tar.gz" -C "$OUT_DIR" .
+            echo "FILE=$FILENAME.tar.gz" >> $GITHUB_ENV
+          else
+            cd "$OUT_DIR" && zip -r "../../$FILENAME.zip" .
+            cd ../../..
+            echo "FILE=$FILENAME.zip" >> $GITHUB_ENV
+          fi
+
+      - name: Dispatch / Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_TOKEN or GH_PAT secret not found. Skipping release step."
+            exit 0
+          fi
+          
+          # Create local release in this repo
+          gh release create "$TAG" $FILE \
+            --title "Adaptive ${{ matrix.branch }} Build $TAG" \
+            --notes "Automated build for ${{ matrix.platform }}." \
+            --prerelease || \
+          gh release upload "$TAG" $FILE --clobber
+
