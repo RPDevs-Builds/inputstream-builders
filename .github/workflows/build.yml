@@ -1,0 +1,49 @@
+name: InputStream Builders Monorepo (Hybrid Escalation)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_input:
+        description: 'Branch to build (Piers / Omega)'
+        required: true
+        default: 'Piers'
+        type: choice
+        options:
+          - Piers
+          - Omega
+          - both
+
+permissions:
+  contents: write
+
+jobs:
+  determine-tier:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.calc.outputs.matrix }}
+    steps:
+      - name: Calculate Platform Matrix
+        id: calc
+        run: |
+          # Platforms matching Kodi targets
+          PLATFORMS='["android-arm64", "android-armv7", "osx64", "ios-arm64", "tvos-arm64", "linux-x86_64", "windows-x86_64"]'
+          if [ "${{ github.event.inputs.branch_input }}" == "both" ]; then
+            echo "matrix={\"branch\": [\"Piers\", \"Omega\"], \"platform\": $PLATFORMS}" >> $GITHUB_OUTPUT
+          else
+            echo "matrix={\"branch\": [\"${{ github.event.inputs.branch_input }}\"], \"platform\": $PLATFORMS}" >> $GITHUB_OUTPUT
+          fi
+
+  build-matrix:
+    needs: determine-tier
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.determine-tier.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Sub-build Workflow
+        run: |
+          echo "Building ${{ matrix.branch }} on ${{ matrix.platform }}"
